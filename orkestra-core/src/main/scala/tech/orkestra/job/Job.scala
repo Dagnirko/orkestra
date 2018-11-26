@@ -1,22 +1,10 @@
 package tech.orkestra.job
 
-import java.io.{IOException, PrintStream}
-import java.time.Instant
-
-import cats.effect.implicits._
-import cats.implicits._
-
-import scala.concurrent.Future
-import scala.concurrent.duration._
 import akka.http.scaladsl.server.Route
 import autowire.Core
-import cats.effect.Effect
-import tech.orkestra.board.JobBoard
-import tech.orkestra.model.Indexed._
-import tech.orkestra.model._
-import tech.orkestra.utils.AkkaImplicits._
-import tech.orkestra.utils.{AutowireServer, Elasticsearch, ElasticsearchOutputStream}
-import tech.orkestra.{kubernetes, CommonApiServer, OrkestraConfig}
+import cats.effect.{ConcurrentEffect, IO}
+import cats.effect.implicits._
+import cats.implicits._
 import com.goyeau.kubernetes.client.KubernetesClient
 import com.sksamuel.elastic4s.circe._
 import com.sksamuel.elastic4s.http.ElasticDsl._
@@ -26,70 +14,83 @@ import io.circe.{Decoder, Encoder, Json}
 import io.circe.generic.auto._
 import io.circe.java8.time._
 import io.k8s.api.core.v1.PodSpec
+import java.io.{IOException, PrintStream}
+import java.time.Instant
+import scala.concurrent.Future
+import scala.concurrent.duration._
 import shapeless._
+import tech.orkestra.board.JobBoard
+import tech.orkestra.model.Indexed._
+import tech.orkestra.model._
+import tech.orkestra.utils.AkkaImplicits._
+import tech.orkestra.utils.{AutowireServer, Elasticsearch, ElasticsearchOutputStream}
+import tech.orkestra.{kubernetes, CommonApiServer, OrkestraConfig}
 
-case class Job[F[_]: Effect, Parameters <: HList: Encoder: Decoder, Result: Encoder: Decoder](
+case class Job[F[_]: ConcurrentEffect, Parameters <: HList: Encoder: Decoder, Result: Encoder: Decoder](
   board: JobBoard[Parameters],
   podSpec: Parameters => PodSpec,
   func: Parameters => F[Result]
 ) {
 
   private[orkestra] def start(runInfo: RunInfo)(
-    implicit orkestraConfig: OrkestraConfig,
-    kubernetesClient: KubernetesClient,
+    implicit
+    orkestraConfig: OrkestraConfig,
+    kubernetesClient: KubernetesClient[F],
     elasticsearchClient: ElasticClient
-  ): Future[Result] = {
-    val runningPong = system.scheduler.schedule(0.second, 1.second)(Jobs.pong(runInfo))
+  ): F[Result] =
+    IO.fromFuture(IO {
+        val runningPong = system.scheduler.schedule(0.second, 1.second)(Jobs.pong(runInfo))
 
-    (for {
-      run <- elasticsearchClient
-        .execute(get(HistoryIndex.index, HistoryIndex.`type`, HistoryIndex.formatId(runInfo)))
-        .map(
-          response => response.fold(throw new IOException(response.error.reason))(_.to[Run[Parameters, Result]])
-        )
+        (for {
+          run <- elasticsearchClient
+            .execute(get(HistoryIndex.index, HistoryIndex.`type`, HistoryIndex.formatId(runInfo)))
+            .map(
+              response => response.fold(throw new IOException(response.error.reason))(_.to[Run[Parameters, Result]])
+            )
 
-      _ = run.parentJob.foreach { parentJob =>
-        system.scheduler.schedule(1.second, 1.second) {
-          CommonApiServer().runningJobs().flatMap { runningJobs =>
-            if (!runningJobs.exists(_.runInfo == parentJob))
-              Jobs
-                .failJob(runInfo, new InterruptedException(s"Parent job ${parentJob.jobId.value} stopped"))
-                .transformWith(_ => kubernetes.Jobs.delete(runInfo))
-            else Future.unit
+          _ = run.parentJob.foreach { parentJob =>
+            system.scheduler.schedule(1.second, 1.second) {
+              CommonApiServer().runningJobs().flatMap { runningJobs =>
+                if (!runningJobs.exists(_.runInfo == parentJob))
+                  Jobs
+                    .failJob(runInfo, new InterruptedException(s"Parent job ${parentJob.jobId.value} stopped"))
+                    .transformWith(_ => ConcurrentEffect[F].toIO(kubernetes.Jobs.delete(runInfo)).unsafeToFuture())
+                else Future.unit
+              }
+            }
           }
-        }
-      }
 
-      result = Jobs.withOutErr(
-        new PrintStream(new ElasticsearchOutputStream(Elasticsearch.client, runInfo.runId), true)
-      ) {
-        println(s"Running job ${board.name}")
-        val result =
-          try func(run.parameters).toIO.unsafeRunSync()
-          catch {
-            case throwable: Throwable =>
-              throwable.printStackTrace()
-              throw throwable
+          result = Jobs.withOutErr(
+            new PrintStream(new ElasticsearchOutputStream(Elasticsearch.client, runInfo.runId), true)
+          ) {
+            println(s"Running job ${board.name}")
+            val result =
+              try func(run.parameters).toIO.unsafeRunSync()
+              catch {
+                case throwable: Throwable =>
+                  throwable.printStackTrace()
+                  throw throwable
+              }
+            println(s"Job ${board.name} completed")
+            result
           }
-        println(s"Job ${board.name} completed")
-        result
-      }
 
-      _ <- Jobs.succeedJob(runInfo, result)
-    } yield result)
-      .recoverWith { case throwable => Jobs.failJob(runInfo, throwable) }
-      .transformWith { triedResult =>
-        for {
-          _ <- Future(runningPong.cancel())
-          _ <- kubernetes.Jobs.delete(runInfo)
-          result <- Future.fromTry(triedResult)
-        } yield result
-      }
-  }
+          _ <- Jobs.succeedJob(runInfo, result)
+        } yield result)
+          .recoverWith { case throwable => Jobs.failJob(runInfo, throwable) }
+          .transformWith { triedResult =>
+            for {
+              _ <- Future(runningPong.cancel())
+              _ <- ConcurrentEffect[F].toIO(kubernetes.Jobs.delete(runInfo)).unsafeToFuture()
+              result <- Future.fromTry(triedResult)
+            } yield result
+          }
+      })
+      .to[F]
 
   private[orkestra] case class ApiServer()(
     implicit orkestraConfig: OrkestraConfig,
-    kubernetesClient: KubernetesClient,
+    kubernetesClient: KubernetesClient[F],
     elasticsearchClient: ElasticClient
   ) extends board.Api {
     override def trigger(
@@ -100,12 +101,14 @@ case class Job[F[_]: Effect, Parameters <: HList: Encoder: Decoder, Result: Enco
     ): Future[Unit] =
       for {
         runInfo <- Future.successful(RunInfo(board.id, runId))
-        _ <- elasticsearchClient.execute(Elasticsearch.indexRun(runInfo, parameters, tags, parent))
+        _ <- elasticsearchClient
+          .execute(Elasticsearch.indexRun(runInfo, parameters, tags, parent))
           .map(response => response.fold(throw new IOException(response.error.reason))(identity))
-        _ <- kubernetes.Jobs.create(runInfo, podSpec(parameters))
+        _ <- ConcurrentEffect[F].toIO(kubernetes.Jobs.create[F](runInfo, podSpec(parameters))).unsafeToFuture()
       } yield ()
 
-    override def stop(runId: RunId): Future[Unit] = kubernetes.Jobs.delete(RunInfo(board.id, runId))
+    override def stop(runId: RunId): Future[Unit] =
+      ConcurrentEffect[F].toIO(kubernetes.Jobs.delete(RunInfo(board.id, runId))).unsafeToFuture()
 
     override def tags(): Future[Seq[String]] = {
       val aggregationName = "tagsForJob"
@@ -165,7 +168,7 @@ case class Job[F[_]: Effect, Parameters <: HList: Encoder: Decoder, Result: Enco
 
   private[orkestra] def apiRoute(
     implicit orkestraConfig: OrkestraConfig,
-    kubernetesClient: KubernetesClient,
+    kubernetesClient: KubernetesClient[F],
     elasticsearchClient: ElasticClient
   ): Route = {
     import akka.http.scaladsl.server.Directives._
@@ -187,9 +190,9 @@ object Job {
     * @param board The board that will represent this job on the UI
     * @param func The function to execute to complete the job
     */
-  def apply[F[_]: Effect, Parameters <: HList: Encoder: Decoder, Result: Encoder: Decoder](
+  def apply[F[_]: ConcurrentEffect, Parameters <: HList: Encoder: Decoder, Result: Encoder: Decoder](
     board: JobBoard[Parameters]
-  )(func: Parameters => F[Result]): Job[F, Parameters, Result] =
+  )(func: => Parameters => F[Result]): Job[F, Parameters, Result] =
     Job(board, _ => PodSpec(Seq.empty), func)
 
   /**
@@ -198,10 +201,10 @@ object Job {
     * @param board The board that will represent this job on the UI
     * @param func The function to execute to complete the job
     */
-  def withPodSpec[F[_]: Effect, Parameters <: HList: Encoder: Decoder, Result: Encoder: Decoder](
+  def withPodSpec[F[_]: ConcurrentEffect, Parameters <: HList: Encoder: Decoder, Result: Encoder: Decoder](
     board: JobBoard[Parameters],
     podSpec: PodSpec
-  )(func: Parameters => F[Result]): Job[F, Parameters, Result] =
+  )(func: => Parameters => F[Result]): Job[F, Parameters, Result] =
     Job(board, _ => podSpec, func)
 
   /**
@@ -210,9 +213,11 @@ object Job {
     * @param board The board that will represent this job on the UI
     * @param func The function to execute to complete the job
     */
-  def withPodSpec[F[_]: Effect, Parameters <: HList: Encoder: Decoder, Result: Encoder: Decoder](
-    board: JobBoard[Parameters],
-    podSpecFunc: Parameters => PodSpec
-  )(func: Parameters => F[Result]): Job[F, Parameters, Result] =
+  def withPodSpec[F[_]: ConcurrentEffect, Parameters <: HList: Encoder: Decoder, Result: Encoder: Decoder](
+    board: JobBoard[Parameters]
+  )(
+    podSpecFunc: => Parameters => PodSpec,
+    func: => Parameters => F[Result]
+  ): Job[F, Parameters, Result] =
     Job(board, podSpecFunc, func)
 }

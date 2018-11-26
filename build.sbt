@@ -25,10 +25,7 @@ ThisBuild / scalacOptions ++= Seq(
   "-Xlint:unsound-match",
   "-Ywarn-inaccessible",
   "-Ywarn-infer-any",
-  "-Ywarn-unused:imports",
-  "-Ywarn-unused:locals",
-  "-Ywarn-unused:patvars",
-  "-Ywarn-unused:privates",
+  "-Ywarn-unused",
   "-Ypartial-unification",
   "-Ywarn-dead-code"
 )
@@ -58,7 +55,7 @@ lazy val `orkestra-core` = crossProject(JVMPlatform, JSPlatform)
       "com.chuusai" %%% "shapeless" % "2.3.3",
       "com.vmunier" %% "scalajs-scripts" % "1.1.2",
       "com.lihaoyi" %%% "autowire" % "0.2.6",
-      "com.goyeau" %% "kubernetes-client" % "0.0.5",
+      "com.goyeau" %% "kubernetes-client" % "0.3.0",
       "org.typelevel" %% "cats-effect" % "1.0.0",
       "org.scala-lang" % "scala-reflect" % scalaVersion.value
     ) ++
@@ -66,6 +63,7 @@ lazy val `orkestra-core` = crossProject(JVMPlatform, JSPlatform)
       akkaHttp.value ++
       akkaHttpCirce.value ++
       circe.value ++
+      cats.value ++
       scalaCss.value ++
       logging.value ++
       elastic4s.value ++
@@ -140,6 +138,7 @@ lazy val `orkestra-integration-tests` = crossProject(JVMPlatform, JSPlatform)
     version ~= (_.replace('+', '-')),
     buildInfoPackage := s"${organization.value}.integration.tests",
     buildInfoKeys += "artifactName" -> artifact.value.name,
+    scalaJSUseMainModuleInitializer := true,
     libraryDependencies ++= scalaTest.value,
     publishArtifact := false,
     publishLocal := {}
@@ -181,6 +180,10 @@ lazy val circe = Def.setting {
     "io.circe" %%% "circe-shapes" % version,
     "io.circe" %%% "circe-java8" % version
   )
+}
+
+lazy val cats = Def.setting {
+  Seq("org.typelevel" %%% "cats-effect" % "1.0.0")
 }
 
 lazy val logging = Def.setting {

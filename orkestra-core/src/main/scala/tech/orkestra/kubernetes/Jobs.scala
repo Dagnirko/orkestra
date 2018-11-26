@@ -1,15 +1,13 @@
 package tech.orkestra.kubernetes
 
-import scala.concurrent.Future
-
+import cats.effect.Sync
+import cats.implicits._
 import com.goyeau.kubernetes.client.KubernetesClient
-
-import tech.orkestra.OrkestraConfig
-import tech.orkestra.utils.AkkaImplicits._
+import cats.implicits._
 import io.k8s.api.batch.v1.{Job => KubeJob}
 import io.k8s.api.core.v1.PodSpec
 import io.k8s.apimachinery.pkg.apis.meta.v1.{DeleteOptions, ObjectMeta}
-
+import tech.orkestra.OrkestraConfig
 import tech.orkestra.model.{EnvRunInfo, RunInfo}
 
 private[orkestra] object Jobs {
@@ -17,12 +15,12 @@ private[orkestra] object Jobs {
   def name(runInfo: RunInfo) =
     s"${runInfo.jobId.value.toLowerCase}-${runInfo.runId.value.toString.split("-").head}"
 
-  def create(
+  def create[F[_]: Sync](
     runInfo: RunInfo,
     podSpec: PodSpec
-  )(implicit orkestraConfig: OrkestraConfig, kubernetesClient: KubernetesClient): Future[Unit] =
+  )(implicit orkestraConfig: OrkestraConfig, kubernetesClient: KubernetesClient[F]): F[Unit] =
     for {
-      masterPod <- MasterPod.get()
+      masterPod <- MasterPod.get
       job = KubeJob(
         metadata = Option(ObjectMeta(name = Option(name(runInfo)))),
         spec = Option(JobSpecs.create(masterPod, EnvRunInfo(runInfo.jobId, Option(runInfo.runId)), podSpec))
@@ -30,12 +28,12 @@ private[orkestra] object Jobs {
       _ <- kubernetesClient.jobs.namespace(orkestraConfig.namespace).create(job)
     } yield ()
 
-  def delete(
+  def delete[F[_]: Sync](
     runInfo: RunInfo
-  )(implicit orkestraConfig: OrkestraConfig, kubernetesClient: KubernetesClient): Future[Unit] = {
+  )(implicit orkestraConfig: OrkestraConfig, kubernetesClient: KubernetesClient[F]): F[Unit] = {
     val jobs = kubernetesClient.jobs.namespace(orkestraConfig.namespace)
 
-    jobs.list().map { jobList =>
+    jobs.list.map { jobList =>
       jobList.items
         .find(RunInfo.fromKubeJob(_) == runInfo)
         .foreach { job =>

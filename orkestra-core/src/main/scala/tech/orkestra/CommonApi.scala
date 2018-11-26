@@ -3,6 +3,9 @@ package tech.orkestra
 import java.io.IOException
 import java.time.Instant
 
+import cats.effect.ConcurrentEffect
+import cats.implicits._
+
 import scala.concurrent.Future
 import com.goyeau.kubernetes.client.KubernetesClient
 import com.sksamuel.elastic4s.circe._
@@ -26,9 +29,9 @@ object CommonApi {
   val client = AutowireClient(OrkestraConfig.commonSegment)[CommonApi]
 }
 
-case class CommonApiServer()(
+case class CommonApiServer[F[_]: ConcurrentEffect]()(
   implicit orkestraConfig: OrkestraConfig,
-  kubernetesClient: KubernetesClient,
+  kubernetesClient: KubernetesClient[F],
   elasticsearchClient: ElasticClient
 ) extends CommonApi {
   import tech.orkestra.utils.AkkaImplicits._
@@ -58,10 +61,14 @@ case class CommonApiServer()(
 
   override def runningJobs(): Future[Seq[Run[HNil, Unit]]] =
     for {
-      runInfos <- kubernetesClient.jobs
-        .namespace(orkestraConfig.namespace)
-        .list()
-        .map(_.items.map(RunInfo.fromKubeJob))
+      runInfos <- ConcurrentEffect[F]
+        .toIO(
+          kubernetesClient.jobs
+            .namespace(orkestraConfig.namespace)
+            .list
+            .map(_.items.map(RunInfo.fromKubeJob))
+        )
+        .unsafeToFuture()
 
       runs <- if (runInfos.nonEmpty)
         elasticsearchClient
